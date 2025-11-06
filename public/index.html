@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Meta CRM</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: #f4f6f9;
+      color: #333;
+      line-height: 1.6;
+      padding: 20px;
+    }
+    .container {
+      max-width: 900px;
+      margin: auto;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 6px 20px rgba(0,0,0,0.08);
+      overflow: hidden;
+    }
+    header {
+      background: #1a73e8;
+      color: white;
+      padding: 20px;
+      text-align: center;
+    }
+    header h1 { margin: 0; font-size: 24px; }
+    .step {
+      display: none;
+      padding: 25px;
+    }
+    .step.active { display: block; }
+    .input-group {
+      margin: 15px 0;
+      display: flex;
+      gap: 10px;
+    }
+    input[type="text"] {
+      flex: 1;
+      padding: 12px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      font-size: 15px;
+    }
+    button {
+      padding: 12px 20px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 500;
+      transition: 0.2s;
+    }
+    .login { background: #1a73e8; color: white; }
+    .login:hover { background: #1557b0; }
+    .sync { background: #28a745; color: white; }
+    .sync:hover { background: #218838; }
+    .sync:disabled { background: #6c757d; cursor: not-allowed; }
+    .refresh { background: #6c757d; color: white; }
+    .refresh:hover { background: #5a6268; }
+    select {
+      padding: 12px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      font-size: 15px;
+      min-width: 250px;
+    }
+    .status {
+      margin: 15px 0;
+      padding: 10px;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+    .status.info { background: #e7f3ff; color: #0c5db5; }
+    .status.success { background: #d4edda; color: #155724; }
+    .status.error { background: #f8d7da; color: #721c24; }
+    .card {
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-left: 4px solid #1a73e8;
+      padding: 16px;
+      margin: 12px 0;
+      border-radius: 6px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+    }
+    .card.new {
+      border-left-color: #28a745;
+      animation: pulse 1s;
+    }
+    @keyframes pulse {
+      0% { transform: scale(1); }
+      50% { transform: scale(1.02); }
+      100% { transform: scale(1); }
+    }
+    .card b { font-size: 16px; }
+    .card small { color: #666; font-size: 13px; }
+    .empty {
+      text-align: center;
+      padding: 40px;
+      color: #999;
+      font-style: italic;
+    }
+    .loader {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      border: 2px solid #f3f3f3;
+      border-top: 2px solid #1a73e8;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin-left: 8px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="container">
+
+    <!-- STEP 1: Login -->
+    <div id="step-login" class="step active">
+      <header><h1>Meta CRM</h1></header>
+      <div style="padding:30px;">
+        <h2>Enter Your User ID</h2>
+        <div class="input-group">
+          <input type="text" id="userIdInput" placeholder="e.g., vendor_123" />
+          <button class="login" onclick="loginWithMeta()">Login with Meta</button>
+        </div>
+        <p style="font-size:14px;color:#666;margin-top:10px;">
+          Use any unique ID (e.g., your name, email, or vendor code)
+        </p>
+      </div>
+    </div>
+
+    <!-- STEP 2: Select Campaign -->
+    <div id="step-campaign" class="step">
+      <header><h1>Select Campaign</h1></header>
+      <div style="padding:25px;">
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+          <select id="campaignSelect">
+            <option>Loading campaigns...</option>
+          </select>
+          <button class="sync" id="syncBtn" onclick="syncSelected()">Sync Leads</button>
+          <button class="refresh" onclick="loadCampaigns()">Refresh</button>
+        </div>
+        <div id="syncStatus" class="status info" style="margin-top:15px;"></div>
+      </div>
+    </div>
+
+    <!-- STEP 3: Leads -->
+    <div id="step-leads" class="step">
+      <header>
+        <h1>Leads <span id="campName"></span></h1>
+      </header>
+      <div style="padding:25px;">
+        <button class="refresh" onclick="loadLeads()">Refresh Leads</button>
+        <div id="leads" style="margin-top:20px;">
+          <div class="empty">Select a campaign and sync to see leads</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    let currentUserId = null;
+    let ws = null;
+
+    // === ON PAGE LOAD ===
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlUserId = urlParams.get('userId');
+    const success = urlParams.get('success') === 'true';
+
+    if (success && urlUserId) {
+      currentUserId = urlUserId;
+      document.getElementById('userIdInput').value = currentUserId;
+      showStep('campaign');
+      initWebSocket();
+      loadCampaigns();
+    }
+
+    // === LOGIN ===
+    function loginWithMeta() {
+      const input = document.getElementById('userIdInput');
+      const userId = input.value.trim();
+      if (!userId) return alert('Please enter a User ID');
+      window.location = `/api/auth/login?userId=${encodeURIComponent(userId)}`;
+    }
+
+    // === SHOW STEP ===
+    function showStep(id) {
+      document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+      document.getElementById(`step-${id}`).classList.add('active');
+    }
+
+    // === WEBSOCKET ===
+    function initWebSocket() {
+      if (ws) ws.close();
+      ws = new WebSocket(`ws://localhost:8086/ws?userId=${currentUserId}`);
+
+      ws.onopen = () => console.log(`[WS] Connected as ${currentUserId}`);
+      ws.onmessage = (e) => {
+        const { type, data } = JSON.parse(e.data);
+        if (type === 'new_lead') {
+          addLeadToTop(data);
+        }
+      };
+      ws.onclose = () => {
+        console.log('[WS] Disconnected. Reconnecting in 3s...');
+        setTimeout(initWebSocket, 3000);
+      };
+    }
+
+    // === LOAD CAMPAIGNS ===
+    async function loadCampaigns() {
+      const select = document.getElementById('campaignSelect');
+      select.innerHTML = '<option>Loading...</option>';
+      select.disabled = true;
+
+      try {
+        const res = await fetch(`/api/leads/campaigns?userId=${currentUserId}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const campaigns = await res.json();
+
+        select.innerHTML = '<option value="">Select a Campaign</option>';
+        campaigns.forEach(c => {
+          const opt = document.createElement('option');
+          opt.value = c.campaign_id;
+          opt.textContent = `${c.name} (${c.status || 'Unknown'})`;
+          select.appendChild(opt);
+        });
+        select.disabled = false;
+      } catch (err) {
+        select.innerHTML = '<option>Error loading campaigns</option>';
+        showStatus('error', 'Failed to load campaigns: ' + err.message);
+      }
+    }
+
+    // === SYNC SELECTED CAMPAIGN ===
+    async function syncSelected() {
+      const campaignId = document.getElementById('campaignSelect').value;
+      if (!campaignId) return alert('Please select a campaign');
+
+      const btn = document.getElementById('syncBtn');
+      btn.disabled = true;
+      btn.innerHTML = 'Syncing... <span class="loader"></span>';
+      showStatus('info', 'Syncing leads from Meta...');
+
+      try {
+        const res = await fetch(`/api/leads/sync/${campaignId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId })
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+          showStatus('success', `${data.synced} leads synced from "${data.campaign}"`);
+          document.getElementById('campName').textContent = ` – ${data.campaign}`;
+          showStep('leads');
+          loadLeads();
+        } else {
+          throw new Error(data.error || 'Sync failed');
+        }
+      } catch (err) {
+        showStatus('error', 'Sync failed: ' + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Sync Leads';
+      }
+    }
+
+    // === LOAD LEADS ===
+    async function loadLeads() {
+      const campaignId = document.getElementById('campaignSelect').value;
+      const url = `/api/leads?userId=${currentUserId}${campaignId ? `&campaignId=${campaignId}` : ''}`;
+
+      const container = document.getElementById('leads');
+      container.innerHTML = '<div class="empty">Loading leads...</div>';
+
+      try {
+        const res = await fetch(url);
+        const leads = await res.json();
+
+        if (leads.length === 0) {
+          container.innerHTML = '<div class="empty">No leads found.<br><small>Try syncing or sending a test lead.</small></div>';
+          return;
+        }
+
+        container.innerHTML = leads.map(l => `
+          <div class="card">
+            <b>${escape(l.name)}</b>
+            ${l.email ? ` – <a href="mailto:${l.email}">${escape(l.email)}</a>` : ''}
+            ${l.phone ? ` – ${escape(l.phone)}` : ''}<br>
+            <small>
+              Form: ${l.form_id} | 
+              ${new Date(l.created_time).toLocaleString()} | 
+              Source: ${l.source || 'unknown'}
+            </small>
+          </div>
+        `).join('');
+      } catch (err) {
+        container.innerHTML = `<div class="status error">Error loading leads: ${err.message}</div>`;
+      }
+    }
+
+    // === ADD NEW LEAD (REAL-TIME) ===
+    function addLeadToTop(lead) {
+      const container = document.getElementById('leads');
+      const div = document.createElement('div');
+      div.className = 'card new';
+      div.innerHTML = `
+        <b>${escape(lead.name)}</b>
+        ${lead.email ? ` – <a href="mailto:${lead.email}">${escape(lead.email)}</a>` : ''}<br>
+        <small style="color:#28a745">
+          NEW • Just now
+        </small>
+      `;
+      container.prepend(div);
+    }
+
+    // === SHOW STATUS ===
+    function showStatus(type, msg) {
+      const el = document.getElementById('syncStatus');
+      el.className = `status ${type}`;
+      el.textContent = msg;
+    }
+
+    // === ESCAPE HTML ===
+    function escape(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+  </script>
+</body>
+</html>
