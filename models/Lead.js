@@ -7,7 +7,7 @@ const leadSchema = new mongoose.Schema({
   created_time: String,
   form_id: String,
   field_data: Array,
-  campaign_id: String,
+  campaign_id: String, // ← Always set
   name: String,
   email: String,
   phone: String,

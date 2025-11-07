@@ -7,7 +7,7 @@ const MetaPage = require("../models/MetaPage");
 const MetaCampaign = require("../models/MetaCampaign");
 const { Parser } = require("json2csv");
 
-// === GET /api/leads/campaigns?userId=demo
+// === GET /api/leads/campaigns?userId=himanshu
 router.get("/campaigns", async (req, res) => {
   const { userId } = req.query;
   if (!userId) return res.status(400).json({ error: "userId required" });
@@ -61,7 +61,7 @@ router.post("/sync-many", async (req, res) => {
   res.json({ totalSynced, totalFetched, campaignIds });
 });
 
-// === CORE SYNC FUNCTION (reusable)
+// === CORE SYNC FUNCTION (WITH RATE LIMIT + DEBUG)
 async function syncSingleCampaign(userId, campaignId) {
   let synced = 0;
   let fetched = 0;
@@ -77,33 +77,62 @@ async function syncSingleCampaign(userId, campaignId) {
     console.log(`[SYNC] Campaign: "${campaign.name}"`);
 
     const pages = await MetaPage.find({ user_id: userId, is_active: true }).lean();
-    if (!pages.length) return { synced: 0, fetched: 0, campaign: campaign.name };
+    if (!pages.length) {
+      console.log(`[SYNC] No active pages found for user`);
+      return { synced: 0, fetched: 0, campaign: campaign.name };
+    }
+
+    // Track rate limit per page
+    const rateLimitBackoff = new Map(); // page_id → next retry time
 
     for (const page of pages) {
-      console.log(`[SYNC] Page: ${page.page_name}`);
+      const pageId = page.page_id;
+      console.log(`\n[SYNC] Page: ${page.page_name} (ID: ${pageId})`);
+
+      // Skip if rate limited
+      if (rateLimitBackoff.has(pageId)) {
+        const retryAfter = rateLimitBackoff.get(pageId);
+        if (Date.now() < retryAfter) {
+          console.warn(`[RATE LIMIT] Skipping ${page.page_name} → retry in ${Math.round((retryAfter - Date.now()) / 1000)}s`);
+          continue;
+        } else {
+          rateLimitBackoff.delete(pageId);
+        }
+      }
 
       let forms = [];
       try {
+        console.log(`[DEBUG] Fetching forms for page ${pageId}`);
         const { data } = await axios.get(
-          `https://graph.facebook.com/v22.0/${page.page_id}/leadgen_forms`,
-          { params: { access_token: page.page_access_token, fields: "id,name" }, timeout: 12000 }
+          `https://graph.facebook.com/v22.0/${pageId}/leadgen_forms`,
+          {
+            params: { access_token: page.page_access_token, fields: "id,name" },
+            timeout: 12000,
+          }
         );
         forms = data.data || [];
-        console.log(`[SYNC] ${forms.length} forms found`);
+        console.log(`[SYNC] ${forms.length} forms found on ${page.page_name}`);
       } catch (e) {
-        console.error(`[SYNC] Forms error:`, e.response?.data?.error?.message || e.message);
+        const errMsg = e.response?.data?.error?.message || e.message;
+        if (e.response?.data?.error?.error_subcode === 80005) {
+          const retryAfter = Date.now() + 70 * 1000; // 70 seconds
+          rateLimitBackoff.set(pageId, retryAfter);
+          console.warn(`[RATE LIMIT] ${page.page_name} → blocked. Retry in 70s`);
+        } else {
+          console.error(`[SYNC] Forms error on ${page.page_name}:`, errMsg);
+        }
         continue;
       }
 
       for (const form of forms) {
-        console.log(`[SYNC] Form: "${form.name}" (ID: ${form.id})`);
+        console.log(`\n[SYNC] Form: "${form.name}" (ID: ${form.id})`);
         let after = null;
         let formSaved = 0;
 
         do {
           let batch;
           try {
-            console.log(`[SYNC] Fetching batch (after: ${after || "start"})`);
+            console.log(`[DEBUG] Fetching leads batch → form: ${form.id}, after: ${after || "start"}`);
             const { data } = await axios.get(
               `https://graph.facebook.com/v22.0/${form.id}/leads`,
               {
@@ -122,30 +151,27 @@ async function syncSingleCampaign(userId, campaignId) {
 
             if (leads.length > 0) {
               console.log(`[DEBUG] Sample lead:`, JSON.stringify(leads[0], null, 2));
+            } else {
+              console.log(`[DEBUG] No leads in this batch`);
             }
 
             for (const lead of leads) {
               const leadCampaignId = lead.campaign_id?.toString();
 
-              // === SAVE ALL LEADS FROM THIS FORM (even if campaign_id missing) ===
               if (leadCampaignId && leadCampaignId !== campaignId) {
-                console.log(`[SKIP] Lead ${lead.id || "null"} → wrong campaign (${leadCampaignId})`);
+                console.log(`[SKIP] Lead ${lead.id} → wrong campaign (${leadCampaignId})`);
                 continue;
               }
 
-              // === FORCE campaign_id to be the sync campaign if missing ===
-              const finalCampaignId = leadCampaignId || campaignId;
+              const finalCampaignId = (leadCampaignId || campaignId).toString();
 
-              // === UNIQUE leadId (real ID or fallback) ===
               const leadId = lead.id || `fb_${form.id}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-              // === SKIP IF ALREADY EXISTS ===
               if (await Lead.exists({ leadId })) {
                 console.log(`[SKIP] Lead ${leadId} → already exists`);
                 continue;
               }
 
-              // === PARSE FIELDS ===
               const fieldData = Array.isArray(lead.field_data) ? lead.field_data : [];
               const fields = {};
               fieldData.forEach(f => {
@@ -154,12 +180,12 @@ async function syncSingleCampaign(userId, campaignId) {
 
               const leadDoc = {
                 user_id: userId,
-                page_id: page.page_id,
+                page_id: pageId,
                 leadId,
                 created_time: lead.created_time,
                 form_id: lead.form_id || form.id,
                 field_data: fieldData,
-                campaign_id: finalCampaignId, // ← ALWAYS SET
+                campaign_id: finalCampaignId,
                 name: fields.FULL_NAME || fields.EMAIL || "Unknown",
                 email: fields.EMAIL || "",
                 phone: fields.PHONE_NUMBER || fields.PHONE || "",
@@ -175,7 +201,7 @@ async function syncSingleCampaign(userId, campaignId) {
                   { $inc: { leads_count: 1 } }
                 );
 
-                console.log(`[SAVED] ${leadId} → ${leadDoc.name} (${leadDoc.email}) | campaign: ${finalCampaignId}`);
+                console.log(`[SAVED] ${leadId} → ${leadDoc.name} (${leadDoc.email}) | form: ${form.id} | campaign: ${finalCampaignId}`);
               } catch (saveErr) {
                 if (saveErr.code === 11000) {
                   console.log(`[SKIP] Lead ${leadId} → duplicate (E11000)`);
@@ -188,21 +214,24 @@ async function syncSingleCampaign(userId, campaignId) {
             after = batch.paging?.cursors?.after;
             if (after) console.log(`[PAGING] Next cursor: ${after}`);
           } catch (e) {
-            if (e.response?.data?.error?.error_subcode === 80005) {
-              console.warn(`[RATE LIMIT] Sleeping 65s...`);
-              await new Promise(r => setTimeout(r, 65000));
-              continue;
+            const subcode = e.response?.data?.error?.error_subcode;
+            if (subcode === 80005) {
+              const retryAfter = Date.now() + 70 * 1000;
+              rateLimitBackoff.set(pageId, retryAfter);
+              console.warn(`[RATE LIMIT] Form ${form.id} → blocked. Retry in 70s`);
+              break; // exit do-while, move to next form
+            } else {
+              console.error(`[SYNC] Batch error (form ${form.id}):`, e.response?.data?.error?.message || e.message);
+              break;
             }
-            console.error(`[SYNC] Batch error:`, e.response?.data?.error?.message || e.message);
-            break;
           }
         } while (after);
 
-        console.log(`[SYNC] Form done → ${formSaved} saved`);
+        console.log(`[SYNC] Form ${form.id} done → ${formSaved} saved`);
       }
     }
 
-    console.log(`[SYNC] Campaign ${campaignId} → ${synced} saved | ${fetched} fetched`);
+    console.log(`\n[SYNC] Campaign ${campaignId} → ${synced} saved | ${fetched} fetched`);
     return { synced, fetched, campaign: campaign.name, campaign_id: campaignId };
   } catch (err) {
     console.error(`[SYNC] Campaign ${campaignId} failed:`, err.message);
@@ -220,7 +249,7 @@ router.get("/", async (req, res) => {
 
   try {
     const leads = await Lead.find(filter).sort({ created_time: -1 }).limit(500).lean();
-    console.log(`[LEADS] Returning ${leads.length} leads`);
+    console.log(`[LEADS] Returning ${leads.length} leads for campaign: ${campaignId || "all"}`);
     res.json(leads);
   } catch (err) {
     console.error(`[LEADS] DB error:`, err.message);
@@ -228,7 +257,7 @@ router.get("/", async (req, res) => {
   }
 });
 
-// === GET /api/leads/export?userId=demo&campaignId=...
+// === GET /api/leads/export
 router.get("/export", async (req, res) => {
   const { userId, campaignId } = req.query;
   if (!userId) return res.status(400).json({ error: "userId required" });
@@ -287,7 +316,7 @@ router.post("/webhook", async (req, res) => {
         const leadId = data.id || `webhook_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
         const newLead = new Lead({
-          user_id: "demo",
+          user_id: "himanshu",
           leadId,
           created_time: data.created_time,
           form_id: data.form_id,
